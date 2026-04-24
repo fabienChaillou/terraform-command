@@ -1,0 +1,563 @@
+// Package api_test contains integration tests and benchmarks for the
+// POST /terraform handler.
+//
+// Tests exercise the full HTTP pipeline: JSON decoding → validation →
+// executor dispatch → JSON encoding, using a real Huma+Chi router wired
+// with a mock Executor so no Temporal connection is required.
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/humachi"
+	"github.com/go-chi/chi/v5"
+
+	"github.com/fabienChaillou/terraform-commander/api"
+	"github.com/fabienChaillou/terraform-commander/command"
+)
+
+// ── Test double ───────────────────────────────────────────────────────────────
+
+// mockExecutor is a configurable test double for api.Executor.
+// The binary is absent because it is now fixed by TerraformBinary in the activity.
+type mockExecutor struct {
+	result *command.ExecutionResult
+	err    error
+	// captured lets tests inspect what was forwarded to the worker.
+	captured struct {
+		args []string
+		opts command.ExecuteOptions
+	}
+}
+
+func (m *mockExecutor) Execute(
+	ctx context.Context,
+	args []string,
+	opts command.ExecuteOptions,
+) (*command.ExecutionResult, error) {
+	m.captured.args = args
+	m.captured.opts = opts
+	return m.result, m.err
+}
+
+// successExecutor returns exit code 0 with fixed stdout.
+func successExecutor() *mockExecutor {
+	return &mockExecutor{
+		result: &command.ExecutionResult{ExitCode: 0, Stdout: "Plan: 3 to add, 0 to change, 0 to destroy.\n"},
+	}
+}
+
+// failedTerraformExecutor returns exit code 1 (terraform error, not a Go error).
+func failedTerraformExecutor() *mockExecutor {
+	return &mockExecutor{
+		result: &command.ExecutionResult{ExitCode: 1, Stderr: "Error: no configuration files"},
+	}
+}
+
+// errorExecutor simulates a worker infrastructure failure (Go error).
+func errorExecutor() *mockExecutor {
+	return &mockExecutor{err: errors.New("temporal: workflow execution timed out")}
+}
+
+// ── Router factory ────────────────────────────────────────────────────────────
+
+func newTestHandler(t *testing.T, exec api.Executor, cfg *api.Config) http.Handler {
+	t.Helper()
+	r := chi.NewRouter()
+	humaAPI := humachi.New(r, huma.DefaultConfig("Test API", "1.0.0"))
+	api.RegisterRoutes(humaAPI, command.NewRegistry(), exec, cfg)
+	return r
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+func postJSON(t *testing.T, handler http.Handler, body interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	return rr
+}
+
+// decodeResult parses the response body into an ExecutionResult.
+func decodeResult(t *testing.T, rr *httptest.ResponseRecorder) *command.ExecutionResult {
+	t.Helper()
+	var result command.ExecutionResult
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("decode ExecutionResult: %v (body: %s)", err, rr.Body.String())
+	}
+	return &result
+}
+
+// decodeError parses the RFC 9457 Problem Details error response.
+func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var body map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v (raw: %s)", err, rr.Body.String())
+	}
+	return body
+}
+
+// ── Integration tests — routing & status codes ────────────────────────────────
+
+func TestHandler_UnknownAction_Returns400(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{"action": "validate"})
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (body: %s)", rr.Code, http.StatusBadRequest, rr.Body)
+	}
+}
+
+func TestHandler_EmptyAction_Returns400(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{"action": ""})
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandler_MissingBody_Returns422(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader([]byte("{}")))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity && rr.Code != http.StatusBadRequest {
+		t.Errorf("empty body: status = %d, want 400 or 422", rr.Code)
+	}
+}
+
+// ── Integration tests — validation (422 / 400) ────────────────────────────────
+
+func TestHandler_PlanNoArgs_Returns422(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{"action": "plan"})
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("plan no-args: status = %d, want 422 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_PlanBadVarType_Returns422(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"var": "env=prod"},
+	})
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("plan bad var: status = %d, want 422 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_PlanUnknownFlag_Returns422(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"refresh": true},
+	})
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("plan unknown flag: status = %d, want 422", rr.Code)
+	}
+}
+
+func TestHandler_WorkspaceMissingSubcommand_Returns400(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{"action": "workspace"})
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("workspace no subcommand: status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandler_WorkspaceUnknownSubcommand_Returns400(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{
+		"action":     "workspace",
+		"subcommand": "rename",
+	})
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("workspace unknown sub: status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandler_WorkspaceNewMissingName_Returns422(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{
+		"action":     "workspace",
+		"subcommand": "new",
+		"args":       map[string]interface{}{},
+	})
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("workspace new no name: status = %d, want 422", rr.Code)
+	}
+}
+
+// ── Integration tests — successful dispatch ───────────────────────────────────
+
+func TestHandler_ValidPlan_Returns200(t *testing.T) {
+	exec := successExecutor()
+	h := newTestHandler(t, exec, nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"var": map[string]interface{}{"env": "prod"}},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid plan: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+	result := decodeResult(t, rr)
+	if result.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", result.ExitCode)
+	}
+}
+
+func TestHandler_ValidApply_Returns200(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "apply",
+		"args":   map[string]interface{}{"auto-approve": true},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid apply: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_ValidInit_Returns200(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "init",
+		"args":   map[string]interface{}{"reconfigure": true},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid init: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_ValidDestroy_Returns200(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "destroy",
+		"args":   map[string]interface{}{"auto-approve": true},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid destroy: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_ValidWorkspaceList_Returns200(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action":     "workspace",
+		"subcommand": "list",
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("workspace list: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+func TestHandler_ValidWorkspaceNew_Returns200(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action":     "workspace",
+		"subcommand": "new",
+		"args":       map[string]interface{}{"name": "feature-123"},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("workspace new: status = %d, want 200 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+// TestHandler_TerraformNonZeroExit verifies that a non-zero terraform exit code
+// is returned as HTTP 200 (the API call succeeded; terraform reported an error).
+func TestHandler_TerraformNonZeroExit_IsStill200(t *testing.T) {
+	h := newTestHandler(t, failedTerraformExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"no-color": true},
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("non-zero exit should still be HTTP 200, got %d (body: %s)", rr.Code, rr.Body)
+	}
+	result := decodeResult(t, rr)
+	if result.ExitCode == 0 {
+		t.Error("ExitCode should be non-zero for a failed terraform command")
+	}
+}
+
+// TestHandler_ExecutorError_Returns500 verifies that an infrastructure-level
+// executor error (e.g. Temporal timeout) produces a 500 response.
+func TestHandler_ExecutorError_Returns500(t *testing.T) {
+	h := newTestHandler(t, errorExecutor(), nil)
+
+	rr := postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"no-color": true},
+	})
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("executor error: status = %d, want 500 (body: %s)", rr.Code, rr.Body)
+	}
+}
+
+// ── Integration tests — config forwarding ────────────────────────────────────
+
+// TestHandler_CustomConfig_Timeouts checks that per-action timeouts from a
+// custom config are correctly forwarded to the executor opts.
+func TestHandler_CustomConfig_Timeouts(t *testing.T) {
+	exec := successExecutor()
+	cfg := &api.Config{
+		TimeoutByAction: command.ActionMap[int]{
+			"plan": 600,
+		},
+		MaxAttemptsByAction: command.ActionMap[int32]{
+			"plan": 2,
+		},
+	}
+	h := newTestHandler(t, exec, cfg)
+
+	postJSON(t, h, map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"no-color": true},
+	})
+
+	if exec.captured.opts.TimeoutSeconds != 600 {
+		t.Errorf("plan timeout = %d, want 600", exec.captured.opts.TimeoutSeconds)
+	}
+	if exec.captured.opts.MaxAttempts != 2 {
+		t.Errorf("plan MaxAttempts = %d, want 2", exec.captured.opts.MaxAttempts)
+	}
+}
+
+// TestHandler_DefaultConfig_ApplyTimeout checks that the default config sets the
+// expected timeout for apply (1800 s).
+func TestHandler_DefaultConfig_ApplyTimeout(t *testing.T) {
+	exec := successExecutor()
+	h := newTestHandler(t, exec, nil) // nil → default config
+
+	postJSON(t, h, map[string]interface{}{
+		"action": "apply",
+		"args":   map[string]interface{}{"auto-approve": true},
+	})
+
+	if exec.captured.opts.TimeoutSeconds != 1800 {
+		t.Errorf("apply timeout = %d, want 1800", exec.captured.opts.TimeoutSeconds)
+	}
+}
+
+// TestHandler_DefaultConfig_ApplyNoRetry ensures apply MaxAttempts = 1
+// (non-idempotent command must never be retried automatically).
+func TestHandler_DefaultConfig_ApplyNoRetry(t *testing.T) {
+	exec := successExecutor()
+	h := newTestHandler(t, exec, nil)
+
+	postJSON(t, h, map[string]interface{}{
+		"action": "apply",
+		"args":   map[string]interface{}{"auto-approve": true},
+	})
+
+	if exec.captured.opts.MaxAttempts != 1 {
+		t.Errorf("apply MaxAttempts = %d, want 1 (no retry for non-idempotent)", exec.captured.opts.MaxAttempts)
+	}
+}
+
+// TestHandler_ActionForwardedInOpts checks that opts.Action is set to the
+// request action so the executor can route to the right workflow.
+func TestHandler_ActionForwardedInOpts(t *testing.T) {
+	exec := successExecutor()
+	h := newTestHandler(t, exec, nil)
+
+	postJSON(t, h, map[string]interface{}{
+		"action": "init",
+		"args":   map[string]interface{}{"upgrade": true},
+	})
+
+	if exec.captured.opts.Action != "init" {
+		t.Errorf("opts.Action = %q, want %q", exec.captured.opts.Action, "init")
+	}
+}
+
+// TestHandler_ErrorResponse_ContainsDetail checks that validation error responses
+// include the command's help text in the "detail" field.
+func TestHandler_ErrorResponse_ContainsDetail(t *testing.T) {
+	h := newTestHandler(t, successExecutor(), nil)
+	rr := postJSON(t, h, map[string]interface{}{"action": "plan"})
+
+	body := decodeError(t, rr)
+	if _, ok := body["detail"]; !ok {
+		t.Errorf("error response missing 'detail' field: %v", body)
+	}
+}
+
+// ── Benchmarks ────────────────────────────────────────────────────────────────
+
+func BenchmarkHandler_ValidPlan(b *testing.B) {
+	h := newBenchHandler(b)
+	body, _ := json.Marshal(map[string]interface{}{
+		"action": "plan",
+		"args":   map[string]interface{}{"var": map[string]interface{}{"env": "prod"}, "no-color": true},
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			b.Fatalf("unexpected status %d", rr.Code)
+		}
+	}
+}
+
+func BenchmarkHandler_ValidationError(b *testing.B) {
+	h := newBenchHandler(b)
+	body, _ := json.Marshal(map[string]interface{}{"action": "plan"})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnprocessableEntity {
+			b.Fatalf("unexpected status %d", rr.Code)
+		}
+	}
+}
+
+func BenchmarkHandler_UnknownAction(b *testing.B) {
+	h := newBenchHandler(b)
+	body, _ := json.Marshal(map[string]interface{}{"action": "fmt"})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			b.Fatalf("unexpected status %d", rr.Code)
+		}
+	}
+}
+
+func BenchmarkHandler_Parallel_ValidPlan(b *testing.B) {
+	h := newBenchHandler(b)
+	body, _ := json.Marshal(map[string]interface{}{
+		"action": "apply",
+		"args":   map[string]interface{}{"auto-approve": true, "no-color": true},
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				b.Fatalf("unexpected status %d", rr.Code)
+			}
+		}
+	})
+}
+
+func BenchmarkHandler_Parallel_MixedLoad(b *testing.B) {
+	h := newBenchHandler(b)
+
+	payloads := [][]byte{
+		mustMarshal(map[string]interface{}{
+			"action": "plan",
+			"args":   map[string]interface{}{"var": map[string]interface{}{"env": "prod"}},
+		}),
+		mustMarshal(map[string]interface{}{
+			"action": "apply",
+			"args":   map[string]interface{}{"auto-approve": true},
+		}),
+		mustMarshal(map[string]interface{}{
+			"action": "init",
+			"args":   map[string]interface{}{"upgrade": true},
+		}),
+		mustMarshal(map[string]interface{}{"action": "plan"}),   // validation error
+		mustMarshal(map[string]interface{}{"action": "fmt"}),    // unknown action
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var counter int64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			idx := int(atomic.AddInt64(&counter, 1)) % len(payloads)
+			body := payloads[idx]
+			req := httptest.NewRequest(http.MethodPost, "/terraform", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			_ = rr.Code
+		}
+	})
+}
+
+// ── bench helpers ─────────────────────────────────────────────────────────────
+
+func newBenchHandler(tb testing.TB) http.Handler {
+	tb.Helper()
+	r := chi.NewRouter()
+	humaAPI := humachi.New(r, huma.DefaultConfig("Bench API", "1.0.0"))
+	exec := &mockExecutor{
+		result: &command.ExecutionResult{ExitCode: 0, Stdout: "ok"},
+	}
+	api.RegisterRoutes(humaAPI, command.NewRegistry(), exec, nil)
+	return r
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
