@@ -1,0 +1,41 @@
+coverage.txt
+.vscode
+.idea/
+
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+### https://raw.github.com/github/gitignore/90f149de451a5433aebd94d02d11b0e28843a1af/Terraform.gitignore
+
+# Local .terraform directories
+**/.terraform*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Local tfvars terraform.tfvars
+**/*.tfvars
+
+# tf lock file
+**/.terraform.lock.hcl
+
