@@ -13,7 +13,10 @@ import (
 
 func TestNewRegistry_ContainsAllCommands(t *testing.T) {
 	r := NewRegistry()
-	expected := []string{"apply", "destroy", "init", "plan", "workspace"}
+	expected := []string{
+		"apply", "destroy", "init", "output", "plan",
+		"refresh", "state", "taint", "unlock", "untaint", "workspace",
+	}
 
 	for _, name := range expected {
 		if _, ok := r.Lookup(name); !ok {
@@ -27,7 +30,10 @@ func TestNewRegistry_Actions_ReturnsAllNames(t *testing.T) {
 	actions := r.Actions()
 	sort.Strings(actions)
 
-	expected := []string{"apply", "destroy", "init", "plan", "workspace"}
+	expected := []string{
+		"apply", "destroy", "init", "output", "plan",
+		"refresh", "state", "taint", "unlock", "untaint", "workspace",
+	}
 	if len(actions) != len(expected) {
 		t.Fatalf("Actions() returned %d names, want %d: %v", len(actions), len(expected), actions)
 	}

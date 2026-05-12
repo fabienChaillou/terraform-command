@@ -38,4 +38,34 @@ var (
 	_ terraform.ArgBuilder   = (*WorkspaceCommand)(nil)
 	_ terraform.HelpProvider = (*WorkspaceCommand)(nil)
 	_ terraform.Command      = (*WorkspaceCommand)(nil)
+
+	_ terraform.Validator    = (*StateCommand)(nil)
+	_ terraform.ArgBuilder   = (*StateCommand)(nil)
+	_ terraform.HelpProvider = (*StateCommand)(nil)
+	_ terraform.Command      = (*StateCommand)(nil)
+
+	_ terraform.Validator    = (*TaintCommand)(nil)
+	_ terraform.ArgBuilder   = (*TaintCommand)(nil)
+	_ terraform.HelpProvider = (*TaintCommand)(nil)
+	_ terraform.Command      = (*TaintCommand)(nil)
+
+	_ terraform.Validator    = (*UntaintCommand)(nil)
+	_ terraform.ArgBuilder   = (*UntaintCommand)(nil)
+	_ terraform.HelpProvider = (*UntaintCommand)(nil)
+	_ terraform.Command      = (*UntaintCommand)(nil)
+
+	_ terraform.Validator    = (*UnlockCommand)(nil)
+	_ terraform.ArgBuilder   = (*UnlockCommand)(nil)
+	_ terraform.HelpProvider = (*UnlockCommand)(nil)
+	_ terraform.Command      = (*UnlockCommand)(nil)
+
+	_ terraform.Validator    = (*RefreshCommand)(nil)
+	_ terraform.ArgBuilder   = (*RefreshCommand)(nil)
+	_ terraform.HelpProvider = (*RefreshCommand)(nil)
+	_ terraform.Command      = (*RefreshCommand)(nil)
+
+	_ terraform.Validator    = (*OutputCommand)(nil)
+	_ terraform.ArgBuilder   = (*OutputCommand)(nil)
+	_ terraform.HelpProvider = (*OutputCommand)(nil)
+	_ terraform.Command      = (*OutputCommand)(nil)
 )

@@ -16,6 +16,14 @@ Main commands:
   plan        Show changes required by the current configuration
   apply       Create or update infrastructure
   destroy     Destroy previously-created infrastructure
+  refresh     Update local state to match real infrastructure
+  output      Read output values from a Terraform state file
+
+State management:
+  state       Advanced state management (subcommands: list | show | mv | rm | pull | push)
+  taint       Mark a resource for recreation on next apply
+  untaint     Remove the "tainted" marker from a resource
+  unlock      Force-release a state lock (CLI verb: force-unlock)
 
 Workspace management:
   workspace   Workspace management (subcommands: new | select | list | delete | show)
